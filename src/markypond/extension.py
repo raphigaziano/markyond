@@ -12,31 +12,27 @@ import hashlib
 import shutil
 
 from markdown.extensions import Extension
-from markdown.blockprocessors import BlockProcessor
+from markdown.preprocessors import Preprocessor
 
 from .exceptions import MarkypondError
 from .lilypond import run_lilypond
-from .utils import mkdirs_for_path, urljoin
+from .utils import dotdict, mkdirs_for_path, urljoin
 
 
 logger = logging.getLogger(__name__)
 
 
-class MarkypondBlockProcessor(BlockProcessor):
+class MarkypondPreprocessor(Preprocessor):
 
     SUPPORTED_OUTPUT_FORMATS = ('svg', 'png', 'pdf')
 
     # start line, e.g., `   {{markypond}} `
-    RE_SRLY_START = re.compile(
-        r'^ *\{+ *markypond *(?P<arg_list>.*?)\}+ *\n?',
+    RE_MARKY_START = re.compile(
+        r'^ *\{+ *markypond *(?P<arg_list>.*?)\}+ *$',
         re.IGNORECASE)
-    # last non-blank line, e.g, '{ /markypond   }\n  \n\n'
-    RE_SRLY_END = re.compile(
-        r'\n *\{+ */markypond *\}+\s*$',
-        re.IGNORECASE)
-    # argument list in opening marker
-    RE_ARG_LIST = re.compile(
-        r'\{+ *markypond *(?P<arg_list>.*?)\}+',
+    # end line, e.g, '{ /markypond   }'
+    RE_MARKY_END = re.compile(
+        r'^ *\{+ */markypond *\}+ *$',
         re.IGNORECASE)
 
     # single block argument
@@ -44,134 +40,111 @@ class MarkypondBlockProcessor(BlockProcessor):
         r'(?P<arg_name>\w+?) *= *[\'"](?P<arg_val>.+?)[\'"]')
 
     def __init__(self, *args, **kwargs):
-        self._cache_dir = kwargs.pop('cache_dir')
-        self._output_dir = kwargs.pop('output_dir')
-        self._output_fmt = kwargs.pop('output_fmt')
-        self._base_url = kwargs.pop('base_url')
+        self.config = {
+            'cache_dir': kwargs.pop('cache_dir'),
+            'output_dir': kwargs.pop('output_dir'),
+            'output_fmt': kwargs.pop('output_fmt'),
+            'base_url': kwargs.pop('base_url'),
+        }
         super().__init__(*args, **kwargs)
-        self.opening_match = None
-        self.block_args = {}
 
-    @property
-    def output_file(self):
-        return self.block_args.get('output_file')
+    def run(self, lines):
 
-    @property
-    def cache_dir(self):
-        return self.block_args.get('cache_dir', self._cache_dir)
+        new_lines = []
+        in_marky_block = False
+        pond_src = []
+        opening_match = None
 
-    @property
-    def output_dir(self):
-        return self.block_args.get('output_dir', self._output_dir)
+        for line in lines:
+            if (match := self.RE_MARKY_START.search(line)):
+                opening_match = match
+                in_marky_block = True
+            elif self.RE_MARKY_END.search(line):
+                if not in_marky_block:
+                    continue
+                block_args = self.parse_args(opening_match)
+                tag = self.run_lilypond('\n'.join(pond_src), block_args)
+                new_lines.append(tag)
+                in_marky_block = False
+                pond_src.clear()
+            elif in_marky_block:
+                pond_src.append(line)
+            else:
+                new_lines.append(line)
 
-    @property
-    def output_fmt(self):
-        return self.block_args.get('output_fmt', self._output_fmt)
+        return new_lines
 
-    @property
-    def base_url(self):
-        return self.block_args.get('base_url', self._base_url)
-
-    def test(self, parent, block):
-        if (m := self.RE_SRLY_START.match(block)):
-            self.opening_match = m
-        return m
-
-    def run(self, parent, blocks):
-        original_block = blocks[0]
-        blocks[0] = self.RE_SRLY_START.sub('', blocks[0])
-
-        self.parse_args()
-
-        if not self.output_file:
-            raise MarkypondError('output_file block argument is required.')
-
-        for block_num, block in enumerate(blocks):
-
-            # Find block with ending tag
-            if self.RE_SRLY_END.search(block):
-
-                fmt = self.output_fmt
-                if fmt not in self.SUPPORTED_OUTPUT_FORMATS:
-                    raise MarkypondError(
-                        f"Output format {fmt} is not supported by MarkyPond.\n"
-                        f"Supported formats: "
-                        f"{', '.join(self.SUPPORTED_OUTPUT_FORMATS)}")
-
-                logger.info('Output format: %s', fmt)
-
-                # Remove opening block
-                blocks[block_num] = self.RE_SRLY_END.sub('', block)
-
-                # Generate cache file from lilypond
-                src = "".join(blocks[0:block_num+1])
-                hashed = hashlib.md5(src.encode('utf-8')).hexdigest()
-                cache_file_path = (
-                    f'{os.path.join(self.cache_dir, hashed)}.{fmt}')
-                run_lilypond(src, cache_file_path)
-                logger.info(
-                    'Lilypond output cached in: %s', cache_file_path)
-
-                # Copy generated file to destination
-                output_file_path = os.path.join(
-                    self.output_dir, self.output_file)
-                mkdirs_for_path(output_file_path)
-                shutil.copy2(cache_file_path, output_file_path)
-                logger.info(
-                    'Copied lilypond input to destination: %s',
-                    output_file_path)
-
-                # Generate tag for html output
-                html_tag = self.generate_tag(self.output_file, fmt)
-                parent.append(html_tag)
-
-                # Remove processed blocks from the block list
-                for _ in range(0, block_num + 1):
-                    blocks.pop(0)
-
-                return True
-
-        # No closing marker:  Restore and do nothing
-        blocks[0] = original_block
-        return False  # equivalent to our test() routine returning False
-
-    def parse_args(self):
-        arg_list = self.opening_match.group('arg_list')
-        self.block_args = {
+    def parse_args(self, opening_match):
+        arg_list = opening_match.group('arg_list')
+        args = self.config.copy()
+        args.update({
             m.group('arg_name'): m.group('arg_val')
             for m in self.RE_SINGLE_ARG.finditer(arg_list)
-        }
-        logger.debug('Markdown block arguments: %s', self.block_args)
+        })
+        logger.debug('Markdown block arguments: %s', args)
+        return dotdict(**args)
 
-    def generate_tag(self, file_name, fmt):
-        if (method := getattr(self, f'generate_tag_for_{fmt}', None)):
-            return method(file_name, fmt)
+    def run_lilypond(self, src, args):
+
+        if 'output_file' not in args:
+            raise MarkypondError('output_file block argument is required.')
+
+        # alias and check output format
+        fmt = args.output_fmt
+        if fmt not in self.SUPPORTED_OUTPUT_FORMATS:
+            raise MarkypondError(
+                f"Output format {fmt} is not supported by MarkyPond.\n"
+                f"Supported formats: "
+                f"{', '.join(self.SUPPORTED_OUTPUT_FORMATS)}")
+
+        logger.info('Output format: %s', fmt)
+
+        # lilypond file generation (cache file)
+        hashed = hashlib.md5(src.encode('utf-8')).hexdigest()
+        cache_file_path = f'{os.path.join(args.cache_dir, hashed)}.{fmt}'
+        run_lilypond(src, cache_file_path)
+        logger.info('Lilypond output cached in: %s', cache_file_path)
+
+        # Copy generated file to destination
+        output_file_path = os.path.join(args.output_dir, args.output_file)
+        mkdirs_for_path(output_file_path)
+        shutil.copy2(cache_file_path, output_file_path)
+        logger.info(
+            'Copied lilypond output to destination: %s', output_file_path)
+
+        # Generate tag for html output
+        html_tag = self.generate_tag(args)
+        return etree.tostring(html_tag).decode('utf-8')
+
+    def generate_tag(self, args):
+        method_name = f'generate_tag_for_{args.output_fmt}'
+        if (method := getattr(self, method_name, None)):
+            return method(args)
         raise NotImplementedError(
-            f'No tag generation implemented for output '
-            f'format {fmt}')
+            f'No tag generation implemented for output format {args.output_fmt}')
 
-    def generate_tag_for_png(self, file_name, fmt):
-        return self.generate_img_tag(file_name, fmt)
+    def generate_tag_for_png(self, args):
+        return self.generate_img_tag(args)
 
-    def generate_tag_for_svg(self, file_name, fmt):
-        return self.generate_img_tag(file_name, fmt)
+    def generate_tag_for_svg(self, args):
+        return self.generate_img_tag(args)
 
-    def generate_tag_for_pdf(self, file_name, fmt):
-        return self.generate_link_tag(file_name, fmt)
+    def generate_tag_for_pdf(self, args):
+        return self.generate_link_tag(args)
 
-    def generate_img_tag(self, file_name, fmt):
+    def generate_img_tag(self, args):
         img = etree.Element('img')
         img.set('class', 'lilypond-img')
-        url = urljoin(self.base_url, file_name)
+        url = urljoin(args.base_url, args.output_file)
         img.set('src', url)
         return img
 
-    def generate_link_tag(self, file_name, fmt):
+    def generate_link_tag(self, args):
         link = etree.Element('a')
         link.set('class', 'lilypond-link')
-        url = urljoin(self.base_url, file_name)
+        url = urljoin(args.base_url, args.output_file)
         link.set('href', url)
-        link.text = self.block_args.get('link_name', '')
+        link.text = args.get('link_name', '')
         return link
 
 
@@ -196,10 +169,12 @@ class MarkypondExtension(Extension):
         super().__init__(**kwargs)
 
     def extendMarkdown(self, md):
-        md.parser.blockprocessors.register(
-            MarkypondBlockProcessor(parser=md.parser, **self.getConfigs()),
+        # Seems to work on all priorities values for now. We may need to adjust
+        # this for compatibility with other extensions.
+        md.preprocessors.register(
+            MarkypondPreprocessor(**self.getConfigs()),
             'markypond',
-            9999,
+            0
         )
 
 

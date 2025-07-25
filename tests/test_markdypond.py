@@ -17,7 +17,7 @@ LILYPOND_SRC_SIMPLE = r'''
   }
   \layout{}
 }'''
-LILYPOND_SRC_HASH = '502a317d29de43443f02f6372e4dd430'
+LILYPOND_SRC_HASH = '892897f8289a8ee303e506e3ce18b8cc'
 
 LILYPOND_SRC_INVALID = ' <gibberish!'
 
@@ -58,7 +58,7 @@ class BaseTestCase(TestCase):
         }
         config.update(config_overrides)
         md = markdown.Markdown(
-            extensions=['markypond'],
+            extensions=['markypond', 'extra'],
             extension_configs={
                 'markypond': config,
             })
@@ -77,7 +77,7 @@ class BaseTestCase(TestCase):
         """
         Convenience helper to retrieve image path from an img src attribute.
         """
-        m = self.RE_IMG_SRC.match(html)
+        m = self.RE_IMG_SRC.search(html)
         return m.group('src_url') if m else None
 
     def get_img_filename(self, html):
@@ -92,7 +92,7 @@ class BaseTestCase(TestCase):
         """
         Convenience helper to retrieve image path from a link href attribute.
         """
-        m = self.RE_LINK_HREF.match(html)
+        m = self.RE_LINK_HREF.search(html)
         return m.group('href_url') if m else None
 
     def get_link_filename(self, html):
@@ -162,7 +162,7 @@ class LilypondTests(BaseTestCase):
 @patch('os.makedirs')
 @patch('shutil.copy2')
 @patch('markypond.extension.run_lilypond')
-class MarkerTests(BaseTestCase):
+class ParserTests(BaseTestCase):
     """ Tests for the markdown marker syntax. """
 
     def test_marker_random_whitespace(self, _, __, ___):
@@ -187,10 +187,10 @@ class MarkerTests(BaseTestCase):
 
     def test_marker_several_brackets(self, _, __, ___):
         result = self.md(
-            f'{{{{{{\nmarkypond output_file="lol.png" }}}}'
+            f'{{{{{{markypond output_file="lol.png" }}}}'
             f'\n{LILYPOND_SRC_SIMPLE}\n'
             f'{{{{/markypond}}')
-        self.assertNotIn('<img class="lilypond-img"', result)
+        self.assertIn('<img class="lilypond-img"', result)
 
     def test_marker_case_ignored(self, _, __, ___):
         result = self.md(
@@ -198,6 +198,26 @@ class MarkerTests(BaseTestCase):
             f'\n{LILYPOND_SRC_SIMPLE}\n'
             f'{{/MarkyPond}}')
         self.assertIn('<img class="lilypond-img"', result)
+
+    def test_several_blocks(self, _, __, ___):
+        result = self.md(
+            f'{{markypond output_file="first.png" }}\n'
+            f'{LILYPOND_SRC_SIMPLE}\n'
+            f'{{/markypond}}\n'
+            f'{{markypond output_file="second.svg" output_fmt="svg" }}\n'
+            f'dummy src\n'
+            f'{{/markypond}}')
+        self.assertIn('src="/first.png"', result)
+        self.assertIn('src="/second.svg"', result)
+
+    def test_compat_with_attr_list_extension(self, _, __, ___):
+        result = self.md(
+            f'{{markypond output_file="first.png" }}\n'
+            f'{LILYPOND_SRC_SIMPLE}\n'
+            f'{{/markypond}}\n'
+            f'{{ #test-id .test-class title="test-title"}}')
+        self.assertIn(
+            '<p class="test-class" id="test-id" title="test-title', result)
 
 
 @patch('os.makedirs')
